@@ -20,6 +20,7 @@ enum FailAt {
 
 /// Real filesystem operations with recorded barriers and a single failure at the chosen stage.
 struct PublicationFault {
+    unsupported: Option<i32>,
     root: PathBuf,
     old_manifest: Vec<u8>,
     stage: FailAt,
@@ -47,6 +48,9 @@ impl AtomicFs for PublicationFault {
     /// Record every barrier and fail the selected stage once, allowing a same-writer retry.
     fn sync_dir(&self, dir: &Path) -> io::Result<()> {
         self.synced.borrow_mut().push(dir.to_path_buf());
+        if let Some(code) = self.unsupported {
+            return Err(io::Error::from_raw_os_error(code));
+        }
         let fail = match self.stage {
             FailAt::Tiles => dir == self.root.join("tiles"),
             FailAt::Blobs => dir == self.root.join("blobs"),
@@ -84,6 +88,7 @@ fn failed_bundle_publication_retains_old_objects_and_same_writer_retry_is_durabl
         let old_objects: Vec<_> = list_objects(&dir).unwrap().into_iter().map(|p| (p.clone(), std::fs::read(dir.join(p)).unwrap())).collect();
         assert!(old_objects.len() >= 2);
         let fs = PublicationFault {
+            unsupported: None,
             old_manifest: std::fs::read(dir.join(MANIFEST)).unwrap(),
             root: dir.clone(),
             stage,
@@ -112,6 +117,40 @@ fn failed_bundle_publication_retains_old_objects_and_same_writer_retry_is_durabl
             );
         }
         assert!(old_objects.iter().all(|(p, _)| !dir.join(p).exists()), "cleanup resumes after the durable retry");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+}
+
+/// Every bundle publication barrier must tolerate an SMB directory-flush capability error.
+#[test]
+fn unsupported_bundle_directory_flush_still_saves_and_reopens() {
+    for code in [1, 50] {
+        let dir = std::env::temp_dir().join(format!("pcraft-smb-{}-{code}", std::process::id()));
+        std::fs::create_dir(&dir).unwrap();
+        let dir = std::fs::canonicalize(dir).unwrap();
+        let mut doc = Document::new("network", Size::new(1, 1), ColorMode::Rgb, SampleType::U8);
+        let mut layer = Layer::raster("pixels", doc.pixel_format());
+        layer.surface_mut().unwrap().write_pixel(0, 0, &[1.0, 0.0, 0.0, 1.0]);
+        doc.layers.push(layer);
+        doc.metadata.exif = Some(Arc::new(vec![3; 100]));
+        let fs = PublicationFault {
+            unsupported: Some(code),
+            root: dir.clone(),
+            old_manifest: Vec::new(),
+            stage: FailAt::Manifest,
+            armed: Cell::new(false),
+            synced: RefCell::new(Vec::new()),
+        };
+        let mut writer = PcraftWriter::new();
+        writer.save_dir_with(&doc, &dir, &SaveOptions::default(), &fs).unwrap();
+        assert_eq!(crate::load_path(&dir).unwrap(), doc);
+        doc.name = "saved again".into();
+        writer.save_dir_with(&doc, &dir, &SaveOptions::default(), &fs).unwrap();
+        assert_eq!(crate::load_path(&dir).unwrap(), doc);
+        for sub in ["tiles", "blobs"] {
+            assert!(fs.synced.borrow().contains(&dir.join(sub)));
+        }
+        assert!(fs.synced.borrow().contains(&dir));
         std::fs::remove_dir_all(dir).unwrap();
     }
 }

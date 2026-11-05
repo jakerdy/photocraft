@@ -663,3 +663,23 @@ fn keeps_the_creation_time_under_a_deny_write_acl() {
     let _ = exacl::setfacl(&[&p], &[], None);
     assert_no_temp(&d.0);
 }
+
+/// SMB can flush files but reject directory flushes after a successful publication.
+#[cfg(windows)]
+#[test]
+fn windows_unsupported_directory_flush_still_creates_and_replaces() {
+    let d = TempDir::new("smb-directory-flush");
+    for code in [1, 50] {
+        let fs = Faulty { fail_sync_dir: Some(Ok(code)), ..Default::default() };
+        let path = d.0.join(format!("document-{code}.pcraft"));
+        atomic_write_with(&fs, NO_RETRY, &path, b"created").unwrap();
+        atomic_write_stream_with(&fs, NO_RETRY, &path, &mut |w| w.write_all(b"replaced")).unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), b"replaced");
+        assert_eq!(fs.synced.get(), 2);
+    }
+    assert!(dir_synced(Err(io::Error::new(io::ErrorKind::Unsupported, "unsupported"))).is_ok());
+    for code in [5, 19, 21, 23, 29, 31, 112] {
+        assert_eq!(dir_synced(Err(io::Error::from_raw_os_error(code))).unwrap_err().raw_os_error(), Some(code));
+    }
+    assert_no_temp(&d.0);
+}
