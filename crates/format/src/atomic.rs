@@ -215,7 +215,7 @@ impl RenameRetry {
 /// Atomically replace (or create) `path` with `bytes`. See the module docs.
 ///
 /// Errors keep their [`io::ErrorKind`]. Before replacement they say the original is unchanged;
-/// a Windows publication-flush error says the new file may not survive a power loss.
+/// a genuine Windows publication-flush error says the new file may not survive a power loss.
 pub fn atomic_write(path: &Path, bytes: &[u8]) -> io::Result<()> {
     atomic_write_with(&RealFs, RenameRetry::platform(), path, bytes)
 }
@@ -350,12 +350,11 @@ fn replace_with(fs: &dyn AtomicFs, retry: RenameRetry, path: &Path, write_tmp: &
         return Err(rename_error(e, path));
     }
     // The new bytes are in place, but until the directory is flushed the rename may not survive
-    // a power loss (#4968). Windows fails the save on any failed flush (#7858). Elsewhere a file
-    // system that can't flush directories at all counts as done; any other failure is reported,
+    // a power loss (#4968). A file system that can't flush directories at all counts as done; any other failure is reported,
     // so the caller keeps the document unsaved and its recovery data instead of discarding them
     // on a save that may not last.
     #[cfg(windows)]
-    fs.sync_dir(&dir).map_err(|e| publication_error(e, path))?;
+    dir_synced(fs.sync_dir(&dir)).map_err(|e| publication_error(e, path))?;
     #[cfg(not(windows))]
     dir_synced(fs.sync_dir(&dir)).map_err(|e| unconfirmed_error(e, path))?;
     Ok(())
@@ -374,11 +373,11 @@ fn open_dir_for_sync(dir: &Path) -> io::Result<Option<std::fs::File>> {
 }
 
 /// `result` of flushing a directory, with "this file system can't flush directories" counted as
-/// success: `EINVAL` (Linux file systems without directory fsync), `ENOTSUP`/`EOPNOTSUPP` and,
+/// success: Windows `ERROR_INVALID_FUNCTION` / `ERROR_NOT_SUPPORTED`, Unix `EINVAL`
+/// (file systems without directory fsync), `ENOTSUP`/`EOPNOTSUPP` and,
 /// on Apple platforms, `ENOTTY`, or [`io::ErrorKind::Unsupported`]. Waiting or retrying won't
 /// change those, and failing every save there would make saving impossible. Any other error is
 /// returned: the flush was attempted and failed.
-#[cfg(not(windows))]
 pub(crate) fn dir_synced(result: io::Result<()>) -> io::Result<()> {
     match result {
         Err(e) if dir_sync_unsupported(&e) => Ok(()),
@@ -386,10 +385,14 @@ pub(crate) fn dir_synced(result: io::Result<()>) -> io::Result<()> {
     }
 }
 
-#[cfg(not(windows))]
 fn dir_sync_unsupported(e: &io::Error) -> bool {
     if e.kind() == io::ErrorKind::Unsupported {
         return true;
+    }
+    // Windows SMB servers may not implement directory FlushFileBuffers. Only capability
+    // errors are ignored, never access denial, disk-full, or device errors.
+    if cfg!(windows) {
+        return matches!(e.raw_os_error(), Some(1 | 50));
     }
     // errno values: EINVAL is 22 everywhere; ENOTSUP and EOPNOTSUPP are 95 on Linux and
     // Android, 45 and 102 on Apple platforms, 45 on the BSDs; ENOTTY is 25. Elsewhere 45 means
